@@ -1,3 +1,5 @@
+#![allow(clippy::needless_doctest_main)]
+
 //! The arena, a fast but limited type of allocator.
 //!
 //! **A fast (but limited) allocation arena for values of a single type.**
@@ -20,10 +22,13 @@
 //!     level: u32,
 //! }
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! let monsters = Arena::new();
 //!
-//! let goku = monsters.alloc(Monster { level: 9001 });
+//! let goku = monsters.alloc(Monster { level: 9001 }).await;
 //! assert!(goku.level > 9000);
+//! # }
 //! ```
 //!
 //! ## Safe Cycles
@@ -40,13 +45,16 @@
 //!     other: Cell<Option<&'a CycleParticipant<'a>>>,
 //! }
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! let arena = Arena::new();
 //!
-//! let a = arena.alloc(CycleParticipant { other: Cell::new(None) });
-//! let b = arena.alloc(CycleParticipant { other: Cell::new(None) });
+//! let a = arena.alloc(CycleParticipant { other: Cell::new(None) }).await;
+//! let b = arena.alloc(CycleParticipant { other: Cell::new(None) }).await;
 //!
 //! a.other.set(Some(b));
 //! b.other.set(Some(a));
+//! }
 //! ```
 
 // Potential optimizations:
@@ -66,12 +74,16 @@ extern crate core;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use core::cell::RefCell;
+extern crate tokio;
+
 use core::cmp;
 use core::iter;
 use core::mem;
 use core::slice;
 use core::str;
+use futures::prelude::*;
+use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::RwLockWriteGuard;
 
 use mem::MaybeUninit;
 
@@ -94,13 +106,16 @@ const MIN_CAPACITY: usize = 1;
 ///     level: u32,
 /// }
 ///
+/// # #[tokio::main]
+/// # async fn main() {
 /// let monsters = Arena::new();
 ///
-/// let vegeta = monsters.alloc(Monster { level: 9001 });
+/// let vegeta = monsters.alloc(Monster { level: 9001 }).await;
 /// assert!(vegeta.level > 9000);
+/// # }
 /// ```
 pub struct Arena<T> {
-    chunks: RefCell<ChunkList<T>>,
+    chunks: AsyncRwLock<ChunkList<T>>,
 }
 
 struct ChunkList<T> {
@@ -108,6 +123,7 @@ struct ChunkList<T> {
     rest: Vec<Vec<T>>,
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl<T> Arena<T> {
     /// Construct a new arena.
     ///
@@ -116,8 +132,7 @@ impl<T> Arena<T> {
     /// ```
     /// use typed_arena::Arena;
     ///
-    /// let arena = Arena::new();
-    /// # arena.alloc(1);
+    /// let arena = Arena::<usize>::new();
     /// ```
     pub fn new() -> Arena<T> {
         let size = cmp::max(1, mem::size_of::<T>());
@@ -131,13 +146,12 @@ impl<T> Arena<T> {
     /// ```
     /// use typed_arena::Arena;
     ///
-    /// let arena = Arena::with_capacity(1337);
-    /// # arena.alloc(1);
+    /// let arena = Arena::<usize>::with_capacity(1337);
     /// ```
     pub fn with_capacity(n: usize) -> Arena<T> {
         let n = cmp::max(MIN_CAPACITY, n);
         Arena {
-            chunks: RefCell::new(ChunkList {
+            chunks: AsyncRwLock::new(ChunkList {
                 current: Vec::with_capacity(n),
                 rest: Vec::new(),
             }),
@@ -153,14 +167,17 @@ impl<T> Arena<T> {
     /// ```
     ///  use typed_arena::Arena;
     ///
+    ///  # #[tokio::main]
+    ///  # async fn main() {
     ///  let arena = Arena::with_capacity(0);
-    ///  let a = arena.alloc(1);
-    ///  let b = arena.alloc(2);
+    ///  let a = arena.alloc(1usize).await;
+    ///  let b = arena.alloc(2usize).await;
     ///
-    ///  assert_eq!(arena.len(), 2);
+    ///  assert_eq!(arena.len().await, 2);
+    ///  # }
     /// ```
-    pub fn len(&self) -> usize {
-        let chunks = self.chunks.borrow();
+    pub async fn len(&self) -> usize {
+        let chunks = self.chunks.read().await;
 
         let mut res = 0;
         for vec in chunks.rest.iter() {
@@ -178,19 +195,22 @@ impl<T> Arena<T> {
     /// ```
     /// use typed_arena::Arena;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let arena = Arena::new();
-    /// let x = arena.alloc(42);
+    /// let x = arena.alloc(42usize).await;
     /// assert_eq!(*x, 42);
+    /// # }
     /// ```
-    #[inline]
-    pub fn alloc(&self, value: T) -> &mut T {
+    pub async fn alloc(&self, value: T) -> &mut T {
         self.alloc_fast_path(value)
-            .unwrap_or_else(|value| self.alloc_slow_path(value))
+            .or_else(|v| self.alloc_slow_path(v).map(Ok::<_, ()>))
+            .await
+            .unwrap()
     }
 
-    #[inline]
-    fn alloc_fast_path(&self, value: T) -> Result<&mut T, T> {
-        let mut chunks = self.chunks.borrow_mut();
+    async fn alloc_fast_path(&self, value: T) -> Result<&mut T, T> {
+        let mut chunks = self.chunks.write().await;
         let len = chunks.current.len();
         if len < chunks.current.capacity() {
             chunks.current.push(value);
@@ -203,8 +223,8 @@ impl<T> Arena<T> {
         }
     }
 
-    fn alloc_slow_path(&self, value: T) -> &mut T {
-        &mut self.alloc_extend(iter::once(value))[0]
+    async fn alloc_slow_path(&self, value: T) -> &mut T {
+        &mut self.alloc_extend(iter::once(value)).await[0]
     }
 
     /// Uses the contents of an iterator to allocate values in the arena.
@@ -215,17 +235,20 @@ impl<T> Arena<T> {
     /// ```
     /// use typed_arena::Arena;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let arena = Arena::new();
-    /// let abc = arena.alloc_extend("abcdefg".chars().take(3));
+    /// let abc = arena.alloc_extend("abcdefg".chars().take(3)).await;
     /// assert_eq!(abc, ['a', 'b', 'c']);
+    /// # }
     /// ```
-    pub fn alloc_extend<I>(&self, iterable: I) -> &mut [T]
+    pub async fn alloc_extend<I>(&self, iterable: I) -> &mut [T]
     where
         I: IntoIterator<Item = T>,
     {
         let mut iter = iterable.into_iter();
 
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.write().await;
 
         let iter_min_len = iter.size_hint().0;
         let mut next_item_index;
@@ -297,15 +320,18 @@ impl<T> Arena<T> {
     ///     mem::transmute(r)
     /// }
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let arena: Arena<bool> = Arena::new();
     /// let slice: &mut [bool];
     /// unsafe {
-    ///     let uninitialized = arena.alloc_uninitialized(10);
+    ///     let uninitialized = arena.alloc_uninitialized(10).await;
     ///     for elem in uninitialized.iter_mut() {
     ///         ptr::write(elem.as_mut_ptr(), true);
     ///     }
     ///     slice = transmute_uninit(uninitialized);
     /// }
+    /// # }
     /// ```
     ///
     /// ## Alternative allocation pattern
@@ -325,15 +351,18 @@ impl<T> Arena<T> {
     ///     mem::transmute(r)
     /// }
     ///
-    /// const COUNT: usize = 2;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let arena: Arena<String> = Arena::new();
     ///
-    /// arena.reserve_extend(COUNT);
+    /// const COUNT: usize = 2;
+    /// arena.reserve_extend(COUNT).await;
+    ///
     /// let slice: &mut [String];
     /// unsafe {
     ///     // Perform initialization before we claim the memory.
-    ///     let uninitialized = arena.uninitialized_array();
+    ///     let uninitialized = arena.uninitialized_array().await;
     ///     assert!((*uninitialized).len() >= COUNT); // Ensured by the reserve_extend
     ///     for elem in &mut (*uninitialized)[..COUNT] {
     ///         ptr::write(elem.as_mut_ptr(), "Hello".to_owned());
@@ -341,13 +370,14 @@ impl<T> Arena<T> {
     ///     let addr = (*uninitialized).as_ptr() as usize;
     ///
     ///     // The alloc_uninitialized returns the same memory, but "confirms" its allocation.
-    ///     slice = transmute_uninit(arena.alloc_uninitialized(COUNT));
+    ///     slice = transmute_uninit(arena.alloc_uninitialized(COUNT).await);
     ///     assert_eq!(addr, slice.as_ptr() as usize);
     ///     assert_eq!(slice, &["Hello".to_owned(), "Hello".to_owned()]);
     /// }
+    /// # }
     /// ```
-    pub unsafe fn alloc_uninitialized(&self, num: usize) -> &mut [MaybeUninit<T>] {
-        let mut chunks = self.chunks.borrow_mut();
+    pub async unsafe fn alloc_uninitialized(&self, num: usize) -> &mut [MaybeUninit<T>] {
+        let mut chunks = self.chunks.write().await;
 
         debug_assert!(
             chunks.current.capacity() >= chunks.current.len(),
@@ -373,8 +403,8 @@ impl<T> Arena<T> {
     /// allows somewhat safer use pattern of [`alloc_uninitialized`][Arena::alloc_uninitialized].
     /// On the other hand this might waste up to `n - 1` elements of space. In case new allocation
     /// is needed, the unused ones in current chunk are never used.
-    pub fn reserve_extend(&self, num: usize) {
-        let mut chunks = self.chunks.borrow_mut();
+    pub async fn reserve_extend(&self, num: usize) {
+        let mut chunks = self.chunks.write().await;
 
         debug_assert!(
             chunks.current.capacity() >= chunks.current.len(),
@@ -394,13 +424,13 @@ impl<T> Arena<T> {
     ///
     /// It returns a raw pointer to avoid creating multiple mutable references to the same place.
     /// It is up to the caller not to dereference it after any of the `alloc_` methods are called.
-    pub fn uninitialized_array(&self) -> *mut [MaybeUninit<T>] {
-        let mut chunks = self.chunks.borrow_mut();
+    pub async fn uninitialized_array(&self) -> *mut [MaybeUninit<T>] {
+        let mut chunks = self.chunks.write().await;
         let len = chunks.current.capacity() - chunks.current.len();
         let next_item_index = chunks.current.len();
 
         unsafe {
-        // Go through pointers, to make sure we never create a reference to uninitialized T.
+            // Go through pointers, to make sure we never create a reference to uninitialized T.
             let start = chunks.current.as_mut_ptr().offset(next_item_index as isize);
             let start_uninit = start as *mut MaybeUninit<T>;
             slice::from_raw_parts_mut(start_uninit, len) as *mut _
@@ -417,15 +447,18 @@ impl<T> Arena<T> {
     /// ```
     /// use typed_arena::Arena;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let arena = Arena::new();
     ///
-    /// arena.alloc("a");
-    /// arena.alloc("b");
-    /// arena.alloc("c");
+    /// arena.alloc("a").await;
+    /// arena.alloc("b").await;
+    /// arena.alloc("c").await;
     ///
     /// let easy_as_123 = arena.into_vec();
     ///
     /// assert_eq!(easy_as_123, vec!["a", "b", "c"]);
+    /// # }
     /// ```
     pub fn into_vec(self) -> Vec<T> {
         let mut chunks = self.chunks.into_inner();
@@ -454,18 +487,21 @@ impl<T> Arena<T> {
     /// #[derive(Debug, PartialEq, Eq)]
     /// struct Point { x: i32, y: i32 };
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let mut arena = Arena::new();
     ///
-    /// arena.alloc(Point { x: 0, y: 0 });
-    /// arena.alloc(Point { x: 1, y: 1 });
+    /// arena.alloc(Point { x: 0, y: 0 }).await;
+    /// arena.alloc(Point { x: 1, y: 1 }).await;
     ///
-    /// for point in arena.iter_mut() {
+    /// for point in arena.iter_mut().await {
     ///     point.x += 10;
     /// }
     ///
     /// let points = arena.into_vec();
     ///
     /// assert_eq!(points, vec![Point { x: 10, y: 0 }, Point { x: 11, y: 1 }]);
+    /// # }
     ///
     /// ```
     ///
@@ -477,20 +513,22 @@ impl<T> Arena<T> {
     /// ```compile_fail
     /// use typed_arena::Arena;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let mut arena = Arena::new();
-    /// let x = arena.alloc(1);
+    /// let x = arena.alloc(1usize).await;
     ///
     /// // borrow error!
-    /// for i in arena.iter_mut() {
+    /// for i in arena.iter_mut().await {
     ///     println!("i: {}", i);
     /// }
     ///
     /// // borrow error!
     /// *x = 2;
+    /// # }
     /// ```
-    #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<T> {
-        let chunks = self.chunks.get_mut();
+    pub async fn iter_mut<'a>(&'a mut self) -> IterMut<'a, T> {
+        let mut chunks = self.chunks.write().await;
         let position = if !chunks.rest.is_empty() {
             let index = 0;
             let inner_iter = chunks.rest[index].iter_mut();
@@ -523,13 +561,15 @@ impl Arena<u8> {
     /// ```
     /// use typed_arena::Arena;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let arena: Arena<u8> = Arena::new();
-    /// let hello = arena.alloc_str("Hello world");
+    /// let hello = arena.alloc_str("Hello world").await;
     /// assert_eq!("Hello world", hello);
+    /// # }
     /// ```
-    #[inline]
-    pub fn alloc_str(&self, s: &str) -> &mut str {
-        let buffer = self.alloc_extend(s.bytes());
+    pub async fn alloc_str(&self, s: &str) -> &mut str {
+        let buffer = self.alloc_extend(s.bytes()).await;
         // Can't fail the utf8 validation, it already came in as utf8
         unsafe { str::from_utf8_unchecked_mut(buffer) }
     }
@@ -573,7 +613,8 @@ enum IterMutState<'a, T> {
 ///
 /// This struct is created by the [`iter_mut`](struct.Arena.html#method.iter_mut) method on [Arenas](struct.Arena.html).
 pub struct IterMut<'a, T: 'a> {
-    chunks: &'a mut ChunkList<T>,
+    chunks: RwLockWriteGuard<'a, ChunkList<T>>,
+    // chunks: &'a mut ChunkList<T>,
     state: IterMutState<'a, T>,
 }
 

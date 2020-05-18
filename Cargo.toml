@@ -9,6 +9,7 @@ repository = "https://github.com/SimonSapin/rust-typed-arena"
 categories = ["memory-management", "no-std"]
 keywords = ["arena"]
 readme = "./README.md"
+edition = "2018"
 
 [lib]
 name = "typed_arena"
@@ -28,3 +29,7 @@ harness = false
 
 [profile.bench]
 debug = true
+
+[dependencies]
+tokio = { version = "0.2", features = ["sync", "rt-threaded", "macros"] }
+futures = { version = "0.3" }

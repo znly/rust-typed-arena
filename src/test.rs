@@ -1,4 +1,5 @@
 use super::*;
+use futures::executor::block_on as fut_block_on;
 use std::cell::Cell;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
@@ -13,23 +14,29 @@ impl<'a> Drop for DropTracker<'a> {
 
 struct Node<'a, 'b: 'a>(Option<&'a Node<'a, 'b>>, u32, DropTracker<'b>);
 
-#[test]
-fn arena_as_intended() {
+#[tokio::test]
+async fn arena_as_intended() {
     let drop_counter = Cell::new(0);
     {
         let arena = Arena::with_capacity(2);
 
-        let mut node: &Node = arena.alloc(Node(None, 1, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 0);
+        let mut node: &Node = arena.alloc(Node(None, 1, DropTracker(&drop_counter))).await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 0);
 
-        node = arena.alloc(Node(Some(node), 2, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 0);
+        node = arena
+            .alloc(Node(Some(node), 2, DropTracker(&drop_counter)))
+            .await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 0);
 
-        node = arena.alloc(Node(Some(node), 3, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        node = arena
+            .alloc(Node(Some(node), 3, DropTracker(&drop_counter)))
+            .await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 1);
 
-        node = arena.alloc(Node(Some(node), 4, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        node = arena
+            .alloc(Node(Some(node), 4, DropTracker(&drop_counter)))
+            .await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 1);
 
         assert_eq!(node.1, 4);
         assert_eq!(node.0.unwrap().1, 3);
@@ -37,19 +44,24 @@ fn arena_as_intended() {
         assert_eq!(node.0.unwrap().0.unwrap().0.unwrap().1, 1);
         assert!(node.0.unwrap().0.unwrap().0.unwrap().0.is_none());
 
-        assert_eq!(arena.len(), 4);
+        assert_eq!(arena.len().await, 4);
 
+        #[allow(clippy::drop_ref)]
         mem::drop(node);
         assert_eq!(drop_counter.get(), 0);
 
-        let mut node: &Node = arena.alloc(Node(None, 5, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        let mut node: &Node = arena.alloc(Node(None, 5, DropTracker(&drop_counter))).await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 1);
 
-        node = arena.alloc(Node(Some(node), 6, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        node = arena
+            .alloc(Node(Some(node), 6, DropTracker(&drop_counter)))
+            .await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 1);
 
-        node = arena.alloc(Node(Some(node), 7, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 2);
+        node = arena
+            .alloc(Node(Some(node), 7, DropTracker(&drop_counter)))
+            .await;
+        assert_eq!(arena.chunks.read().await.rest.len(), 2);
 
         assert_eq!(drop_counter.get(), 0);
 
@@ -63,47 +75,50 @@ fn arena_as_intended() {
     assert_eq!(drop_counter.get(), 7);
 }
 
-#[test]
-fn ensure_into_vec_maintains_order_of_allocation() {
+#[tokio::test]
+async fn ensure_into_vec_maintains_order_of_allocation() {
     let arena = Arena::with_capacity(1); // force multiple inner vecs
     for &s in &["t", "e", "s", "t"] {
-        arena.alloc(String::from(s));
+        arena.alloc(String::from(s)).await;
     }
     let vec = arena.into_vec();
     assert_eq!(vec, vec!["t", "e", "s", "t"]);
 }
 
-#[test]
-fn test_zero_cap() {
+#[tokio::test]
+async fn test_zero_cap() {
     let arena = Arena::with_capacity(0);
-    let a = arena.alloc(1);
-    let b = arena.alloc(2);
+    let a = arena.alloc(1).await;
+    let b = arena.alloc(2).await;
     assert_eq!(*a, 1);
     assert_eq!(*b, 2);
-    assert_eq!(arena.len(), 2);
+    assert_eq!(arena.len().await, 2);
 }
 
-#[test]
-fn test_alloc_extend() {
+#[tokio::test]
+async fn test_alloc_extend() {
     let arena = Arena::with_capacity(2);
     for i in 0..15 {
-        let slice = arena.alloc_extend(0..i);
+        let slice = arena.alloc_extend(0..i).await;
         for (j, &elem) in slice.iter().enumerate() {
             assert_eq!(j, elem);
         }
     }
 }
 
-#[test]
-fn test_alloc_uninitialized() {
+#[tokio::test]
+async fn test_alloc_uninitialized() {
     const LIMIT: usize = 15;
     let drop_counter = Cell::new(0);
     unsafe {
         let arena: Arena<Node> = Arena::with_capacity(4);
         for i in 0..LIMIT {
-            let slice = arena.alloc_uninitialized(i);
+            let slice = arena.alloc_uninitialized(i).await;
             for (j, elem) in slice.iter_mut().enumerate() {
-                ptr::write(elem.as_mut_ptr(), Node(None, j as u32, DropTracker(&drop_counter)));
+                ptr::write(
+                    elem.as_mut_ptr(),
+                    Node(None, j as u32, DropTracker(&drop_counter)),
+                );
             }
             assert_eq!(drop_counter.get(), 0);
         }
@@ -111,16 +126,16 @@ fn test_alloc_uninitialized() {
     assert_eq!(drop_counter.get(), (0..LIMIT).fold(0, |a, e| a + e) as u32);
 }
 
-#[test]
-fn test_alloc_extend_with_drop_counter() {
+#[tokio::test]
+async fn test_alloc_extend_with_drop_counter() {
     let drop_counter = Cell::new(0);
     {
         let arena = Arena::with_capacity(2);
         let iter = (0..100).map(|j| Node(None, j as u32, DropTracker(&drop_counter)));
-        let older_ref = Some(&arena.alloc_extend(iter)[0]);
+        let older_ref = Some(&arena.alloc_extend(iter).await[0]);
         assert_eq!(drop_counter.get(), 0);
         let iter = (0..100).map(|j| Node(older_ref, j as u32, DropTracker(&drop_counter)));
-        arena.alloc_extend(iter);
+        arena.alloc_extend(iter).await;
         assert_eq!(drop_counter.get(), 0);
     }
     assert_eq!(drop_counter.get(), 200);
@@ -130,12 +145,12 @@ fn test_alloc_extend_with_drop_counter() {
 ///
 /// Bools, unlike integers, have invalid bit patterns. Therefore, ever having an uninitialized bool
 /// is insta-UB. Make sure miri doesn't find any such thing.
-#[test]
-fn test_alloc_uninitialized_bools() {
+#[tokio::test]
+async fn test_alloc_uninitialized_bools() {
     const LEN: usize = 20;
     unsafe {
         let arena: Arena<bool> = Arena::with_capacity(2);
-        let slice = arena.alloc_uninitialized(LEN);
+        let slice = arena.alloc_uninitialized(LEN).await;
         for elem in slice.iter_mut() {
             ptr::write(elem.as_mut_ptr(), true);
         }
@@ -146,8 +161,8 @@ fn test_alloc_uninitialized_bools() {
 }
 
 /// Check nothing bad happens by panicking during initialization of borrowed slice.
-#[test]
-fn alloc_uninitialized_with_panic() {
+#[tokio::test]
+async fn alloc_uninitialized_with_panic() {
     struct Dropper(bool);
 
     impl Drop for Dropper {
@@ -162,36 +177,37 @@ fn alloc_uninitialized_with_panic() {
     let mut reached_first_init = false;
     panic::catch_unwind(AssertUnwindSafe(|| unsafe {
         let arena: Arena<Dropper> = Arena::new();
-        arena.reserve_extend(2);
-        let uninitialized = arena.uninitialized_array();
+        fut_block_on(arena.reserve_extend(2));
+        let uninitialized = fut_block_on(arena.uninitialized_array());
         assert!((*uninitialized).len() >= 2);
         ptr::write((*uninitialized)[0].as_mut_ptr(), Dropper(false));
         reached_first_init = true;
         panic!("To drop the arena");
         // If it didn't panic, we would continue by initializing the second one and confirming by
         // .alloc_uninitialized();
-    })).unwrap_err();
+    }))
+    .unwrap_err();
     assert!(reached_first_init);
 }
 
-#[test]
-fn test_uninitialized_array() {
+#[tokio::test]
+async fn test_uninitialized_array() {
     let arena = Arena::with_capacity(2);
-    let uninit = arena.uninitialized_array();
-    arena.alloc_extend(0..2);
+    let uninit = arena.uninitialized_array().await;
+    arena.alloc_extend(0..2).await;
     unsafe {
         for (&a, b) in (&*uninit).iter().zip(0..2) {
             assert_eq!(a.assume_init(), b);
         }
-        assert!((&*arena.uninitialized_array()).as_ptr() != (&*uninit).as_ptr());
-        arena.alloc(0);
-        let uninit = arena.uninitialized_array();
+        assert!((&*arena.uninitialized_array().await).as_ptr() != (&*uninit).as_ptr());
+        arena.alloc(0).await;
+        let uninit = arena.uninitialized_array().await;
         assert_eq!((&*uninit).len(), 3);
     }
 }
 
-#[test]
-fn dont_trust_the_iterator_size() {
+#[tokio::test]
+async fn dont_trust_the_iterator_size() {
     use std::iter::repeat;
 
     struct WrongSizeIter<I>(I);
@@ -213,15 +229,17 @@ fn dont_trust_the_iterator_size() {
     impl<I> ExactSizeIterator for WrongSizeIter<I> where I: Iterator {}
 
     let arena = Arena::with_capacity(2);
-    arena.alloc(0);
-    let slice = arena.alloc_extend(WrongSizeIter(repeat(1).take(1_000)));
+    arena.alloc(0).await;
+    let slice = arena
+        .alloc_extend(WrongSizeIter(repeat(1i32).take(1_000)))
+        .await;
     // Allocation of 1000 elements should have created a new chunk
-    assert_eq!(arena.chunks.borrow().rest.len(), 1);
+    assert_eq!(arena.chunks.read().await.rest.len(), 1);
     assert_eq!(slice.len(), 1000);
 }
 
-#[test]
-fn arena_is_send() {
+#[tokio::test]
+async fn arena_is_send() {
     fn assert_is_send<T: Send>(_: T) {}
 
     // If `T` is `Send`, ...
@@ -232,8 +250,8 @@ fn arena_is_send() {
     assert_is_send(arena);
 }
 
-#[test]
-fn iter_mut_low_capacity() {
+#[tokio::test]
+async fn iter_mut_low_capacity() {
     #[derive(Debug, PartialEq, Eq)]
     struct NonCopy(usize);
 
@@ -242,15 +260,15 @@ fn iter_mut_low_capacity() {
 
     let mut arena = Arena::with_capacity(CAP);
     for i in 1..MAX {
-        arena.alloc(NonCopy(i));
+        arena.alloc(NonCopy(i)).await;
     }
 
     assert!(
-        arena.chunks.borrow().rest.len() > 1,
+        arena.chunks.read().await.rest.len() > 1,
         "expected multiple chunks"
     );
 
-    let mut iter = arena.iter_mut();
+    let mut iter = arena.iter_mut().await;
     for i in 1..MAX {
         assert_eq!(Some(&mut NonCopy(i)), iter.next());
     }
@@ -258,8 +276,8 @@ fn iter_mut_low_capacity() {
     assert_eq!(None, iter.next());
 }
 
-#[test]
-fn iter_mut_high_capacity() {
+#[tokio::test]
+async fn iter_mut_high_capacity() {
     #[derive(Debug, PartialEq, Eq)]
     struct NonCopy(usize);
 
@@ -268,15 +286,15 @@ fn iter_mut_high_capacity() {
 
     let mut arena = Arena::with_capacity(CAP);
     for i in 1..MAX {
-        arena.alloc(NonCopy(i));
+        arena.alloc(NonCopy(i)).await;
     }
 
     assert!(
-        arena.chunks.borrow().rest.is_empty(),
+        arena.chunks.read().await.rest.is_empty(),
         "expected single chunk"
     );
 
-    let mut iter = arena.iter_mut();
+    let mut iter = arena.iter_mut().await;
     for i in 1..MAX {
         assert_eq!(Some(&mut NonCopy(i)), iter.next());
     }
@@ -299,8 +317,8 @@ fn assert_size_hint<T>(arena_len: usize, iter: IterMut<'_, T>) {
     assert!(max <= arena_len * 3);
 }
 
-#[test]
-fn size_hint() {
+#[tokio::test]
+async fn size_hint() {
     #[derive(Debug, PartialEq, Eq)]
     struct NonCopy(usize);
 
@@ -310,16 +328,16 @@ fn size_hint() {
     for cap in CAP..(CAP + 16/* check some non-power-of-two capacities */) {
         let mut arena = Arena::with_capacity(cap);
         for i in 1..MAX {
-            arena.alloc(NonCopy(i));
-            let iter = arena.iter_mut();
+            arena.alloc(NonCopy(i)).await;
+            let iter = arena.iter_mut().await;
             assert_size_hint(i, iter);
         }
     }
 }
 
-#[test]
+#[tokio::test]
 #[cfg_attr(miri, ignore)]
-fn size_hint_low_initial_capacities() {
+async fn size_hint_low_initial_capacities() {
     #[derive(Debug, PartialEq, Eq)]
     struct NonCopy(usize);
 
@@ -329,16 +347,16 @@ fn size_hint_low_initial_capacities() {
     for cap in CAP..(CAP + 128/* check some non-power-of-two capacities */) {
         let mut arena = Arena::with_capacity(cap);
         for i in 1..MAX {
-            arena.alloc(NonCopy(i));
-            let iter = arena.iter_mut();
+            arena.alloc(NonCopy(i)).await;
+            let iter = arena.iter_mut().await;
             assert_size_hint(i, iter);
         }
     }
 }
 
-#[test]
+#[tokio::test]
 #[cfg_attr(miri, ignore)]
-fn size_hint_high_initial_capacities() {
+async fn size_hint_high_initial_capacities() {
     #[derive(Debug, PartialEq, Eq)]
     struct NonCopy(usize);
 
@@ -348,16 +366,16 @@ fn size_hint_high_initial_capacities() {
     for cap in CAP..(CAP + 128/* check some non-power-of-two capacities */) {
         let mut arena = Arena::with_capacity(cap);
         for i in 1..MAX {
-            arena.alloc(NonCopy(i));
-            let iter = arena.iter_mut();
+            arena.alloc(NonCopy(i)).await;
+            let iter = arena.iter_mut().await;
             assert_size_hint(i, iter);
         }
     }
 }
 
-#[test]
+#[tokio::test]
 #[cfg_attr(miri, ignore)]
-fn size_hint_many_items() {
+async fn size_hint_many_items() {
     #[derive(Debug, PartialEq, Eq)]
     struct NonCopy(usize);
 
@@ -366,8 +384,8 @@ fn size_hint_many_items() {
 
     let mut arena = Arena::with_capacity(CAP);
     for i in 1..MAX {
-        arena.alloc(NonCopy(i));
-        let iter = arena.iter_mut();
+        arena.alloc(NonCopy(i)).await;
+        let iter = arena.iter_mut().await;
         assert_size_hint(i, iter);
     }
 }
