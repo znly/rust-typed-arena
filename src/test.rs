@@ -20,16 +20,16 @@ fn arena_as_intended() {
         let arena = Arena::with_capacity(2);
 
         let mut node: &Node = arena.alloc(Node(None, 1, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 0);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 0);
 
         node = arena.alloc(Node(Some(node), 2, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 0);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 0);
 
         node = arena.alloc(Node(Some(node), 3, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 1);
 
         node = arena.alloc(Node(Some(node), 4, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 1);
 
         assert_eq!(node.1, 4);
         assert_eq!(node.0.unwrap().1, 3);
@@ -39,17 +39,18 @@ fn arena_as_intended() {
 
         assert_eq!(arena.len(), 4);
 
+        #[allow(clippy::drop_ref)]
         mem::drop(node);
         assert_eq!(drop_counter.get(), 0);
 
         let mut node: &Node = arena.alloc(Node(None, 5, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 1);
 
         node = arena.alloc(Node(Some(node), 6, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 1);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 1);
 
         node = arena.alloc(Node(Some(node), 7, DropTracker(&drop_counter)));
-        assert_eq!(arena.chunks.borrow().rest.len(), 2);
+        assert_eq!(arena.chunks.lock().unwrap().rest.len(), 2);
 
         assert_eq!(drop_counter.get(), 0);
 
@@ -103,7 +104,10 @@ fn test_alloc_uninitialized() {
         for i in 0..LIMIT {
             let slice = arena.alloc_uninitialized(i);
             for (j, elem) in slice.iter_mut().enumerate() {
-                ptr::write(elem.as_mut_ptr(), Node(None, j as u32, DropTracker(&drop_counter)));
+                ptr::write(
+                    elem.as_mut_ptr(),
+                    Node(None, j as u32, DropTracker(&drop_counter)),
+                );
             }
             assert_eq!(drop_counter.get(), 0);
         }
@@ -170,7 +174,8 @@ fn alloc_uninitialized_with_panic() {
         panic!("To drop the arena");
         // If it didn't panic, we would continue by initializing the second one and confirming by
         // .alloc_uninitialized();
-    })).unwrap_err();
+    }))
+    .unwrap_err();
     assert!(reached_first_init);
 }
 
@@ -216,7 +221,7 @@ fn dont_trust_the_iterator_size() {
     arena.alloc(0);
     let slice = arena.alloc_extend(WrongSizeIter(repeat(1).take(1_000)));
     // Allocation of 1000 elements should have created a new chunk
-    assert_eq!(arena.chunks.borrow().rest.len(), 1);
+    assert_eq!(arena.chunks.lock().unwrap().rest.len(), 1);
     assert_eq!(slice.len(), 1000);
 }
 
@@ -246,7 +251,7 @@ fn iter_mut_low_capacity() {
     }
 
     assert!(
-        arena.chunks.borrow().rest.len() > 1,
+        arena.chunks.lock().unwrap().rest.len() > 1,
         "expected multiple chunks"
     );
 
@@ -272,7 +277,7 @@ fn iter_mut_high_capacity() {
     }
 
     assert!(
-        arena.chunks.borrow().rest.is_empty(),
+        arena.chunks.lock().unwrap().rest.is_empty(),
         "expected single chunk"
     );
 

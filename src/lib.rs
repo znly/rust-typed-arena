@@ -66,12 +66,12 @@ extern crate core;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use core::cell::RefCell;
 use core::cmp;
 use core::iter;
 use core::mem;
 use core::slice;
 use core::str;
+use std::sync::Mutex;
 
 use mem::MaybeUninit;
 
@@ -100,7 +100,7 @@ const MIN_CAPACITY: usize = 1;
 /// assert!(vegeta.level > 9000);
 /// ```
 pub struct Arena<T> {
-    chunks: RefCell<ChunkList<T>>,
+    chunks: Mutex<ChunkList<T>>,
 }
 
 struct ChunkList<T> {
@@ -137,7 +137,7 @@ impl<T> Arena<T> {
     pub fn with_capacity(n: usize) -> Arena<T> {
         let n = cmp::max(MIN_CAPACITY, n);
         Arena {
-            chunks: RefCell::new(ChunkList {
+            chunks: Mutex::new(ChunkList {
                 current: Vec::with_capacity(n),
                 rest: Vec::new(),
             }),
@@ -160,7 +160,7 @@ impl<T> Arena<T> {
     ///  assert_eq!(arena.len(), 2);
     /// ```
     pub fn len(&self) -> usize {
-        let chunks = self.chunks.borrow();
+        let chunks = self.chunks.lock().unwrap();
 
         let mut res = 0;
         for vec in chunks.rest.iter() {
@@ -190,7 +190,7 @@ impl<T> Arena<T> {
 
     #[inline]
     fn alloc_fast_path(&self, value: T) -> Result<&mut T, T> {
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
         let len = chunks.current.len();
         if len < chunks.current.capacity() {
             chunks.current.push(value);
@@ -225,7 +225,7 @@ impl<T> Arena<T> {
     {
         let mut iter = iterable.into_iter();
 
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
 
         let iter_min_len = iter.size_hint().0;
         let mut next_item_index;
@@ -347,7 +347,7 @@ impl<T> Arena<T> {
     /// }
     /// ```
     pub unsafe fn alloc_uninitialized(&self, num: usize) -> &mut [MaybeUninit<T>] {
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
 
         debug_assert!(
             chunks.current.capacity() >= chunks.current.len(),
@@ -374,7 +374,7 @@ impl<T> Arena<T> {
     /// On the other hand this might waste up to `n - 1` elements of space. In case new allocation
     /// is needed, the unused ones in current chunk are never used.
     pub fn reserve_extend(&self, num: usize) {
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
 
         debug_assert!(
             chunks.current.capacity() >= chunks.current.len(),
@@ -395,12 +395,12 @@ impl<T> Arena<T> {
     /// It returns a raw pointer to avoid creating multiple mutable references to the same place.
     /// It is up to the caller not to dereference it after any of the `alloc_` methods are called.
     pub fn uninitialized_array(&self) -> *mut [MaybeUninit<T>] {
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
         let len = chunks.current.capacity() - chunks.current.len();
         let next_item_index = chunks.current.len();
 
         unsafe {
-        // Go through pointers, to make sure we never create a reference to uninitialized T.
+            // Go through pointers, to make sure we never create a reference to uninitialized T.
             let start = chunks.current.as_mut_ptr().offset(next_item_index as isize);
             let start_uninit = start as *mut MaybeUninit<T>;
             slice::from_raw_parts_mut(start_uninit, len) as *mut _
@@ -428,7 +428,7 @@ impl<T> Arena<T> {
     /// assert_eq!(easy_as_123, vec!["a", "b", "c"]);
     /// ```
     pub fn into_vec(self) -> Vec<T> {
-        let mut chunks = self.chunks.into_inner();
+        let mut chunks = self.chunks.into_inner().unwrap();
         // keep order of allocation in the resulting Vec
         let n = chunks
             .rest
@@ -490,7 +490,7 @@ impl<T> Arena<T> {
     /// ```
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<T> {
-        let chunks = self.chunks.get_mut();
+        let chunks = &mut *self.chunks.lock().unwrap();
         let position = if !chunks.rest.is_empty() {
             let index = 0;
             let inner_iter = chunks.rest[index].iter_mut();
@@ -506,7 +506,7 @@ impl<T> Arena<T> {
             IterMutState::ChunkListCurrent { iter }
         };
         IterMut {
-            chunks,
+            chunks: unsafe { mem::transmute(chunks) },
             state: position,
         }
     }
